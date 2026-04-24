@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">视觉伙伴</string>
+    <!-- NOTE: Avoid unescaped & and XML-illegal chars. Use &amp; for & -->
+    <string name="dashscope_url">wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen-omni-turbo-realtime</string>
+    <string name="api_key">sk-8f96bae0f4f94f698a0be72e4cfa5e59</string>
+    <string name="system_prompt">你是一位实时多模态视觉与语音感知专家，需要根据用户的语音输入和图片将他们所处场景中的视觉信息转换为清晰、生动的语音描述。</string>
+</resources>

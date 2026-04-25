@@ -1,6 +1,7 @@
 package com.example.vva
 
 import android.content.Context
+import android.speech.tts.TextToSpeech
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -24,12 +25,15 @@ class VoiceViewModel : ViewModel() {
     private var audioPlayer: AudioPlayer? = null
     private var microphoneRecorder: MicrophoneRecorder? = null
     private var realtimeClient: OmniRealtimeClient? = null
+    private var navigationBackendClient: NavigationBackendClient? = null
+    private var tts: TextToSpeech? = null
 
     @Volatile
     private var isInitializer = false
 
     @Volatile
     private var isUserSpeaking = false
+    private var isExternalSpeaking = false
 
     private var feedImageJob: Job? = null
 
@@ -44,10 +48,25 @@ class VoiceViewModel : ViewModel() {
             return
         }
         isInitializer = true
+        // 初始化本地 TTS
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = java.util.Locale.CHINESE
+            }
+        }
         viewModelScope.launch {
             try {
                 audioPlayer = AudioPlayer(context).apply { start() }
                 microphoneRecorder = MicrophoneRecorder(context)
+                // Initialize Navigation Backend Client
+                navigationBackendClient = NavigationBackendClient(
+                    backendWsUrl = context.getString(R.string.nav_backend_url),
+                    onStatusChanged = { status -> Timber.tag(TAG).i("Nav status: $status") },
+                    onGuidanceText = { guidance ->
+                        aiText.update { "[导航] $guidance" }
+                        speakTextLocally(guidance)
+                    }
+                )
                 realtimeClient = OmniRealtimeClient(
                     apiKey = context.getString(R.string.api_key),
                     onConnected = {
@@ -61,7 +80,11 @@ class VoiceViewModel : ViewModel() {
                         connectState.update { "disconnected" }
                     },
                     onResponseText = { text ->
-                        aiText.update { it + text }
+                        if (aiText.value.startsWith("[导航]")) {
+                            aiText.update { text }
+                        } else {
+                            aiText.update { it + text }
+                        }
                         Timber.tag(TAG).d("onResponseText: ${aiText.value}")
                     },
                     onResponseAudio = { audioData ->
@@ -71,23 +94,32 @@ class VoiceViewModel : ViewModel() {
                     },
                     onResponseDone = {
                         Timber.tag(TAG).i("onResponseDone")
+                        isExternalSpeaking = false
                         realtimeClient?.clearAudioBuffer()
                     },
                     onAsrResult = { text ->
                         userText.update { text }
                         Timber.tag(TAG).i("onAsrResult: $text")
+                        val intent = NavigationKeywordMatcher.match(text)
+                        if (intent.isStop) {
+                            navigationBackendClient?.sendStopNavigationRequest()
+                        } else if (intent.isNavigation) {
+                            navigationBackendClient?.sendNavigationRequest(text, intent.target)
+                        }
                     },
                     onVadBegin = {
                         Timber.tag(TAG).i("onVadBegin")
                         isUserSpeaking = true
-                        userText.update { "" }
-                        aiText.update { "" }
+                        if (!isExternalSpeaking) {
+                            userText.update { "" }
+                            aiText.update { "" }
+                            // 停止播放AI当前的回复，允许用户打断AI
+                            realtimeClient?.clearAudioBuffer()
+                            audioPlayer?.prepareForNextTurn()
+                        }
 
                         // 立即发送图片
                         sendImage(imageManager)
-                        // 停止播放AI当前的回复，允许用户打断AI
-                        realtimeClient?.clearAudioBuffer()
-                        audioPlayer?.prepareForNextTurn()
                     },
                     onVadEnd = {
                         Timber.tag(TAG).i("onVadEnd")
@@ -151,6 +183,16 @@ class VoiceViewModel : ViewModel() {
         super.onCleared()
         audioPlayer?.stop()
         microphoneRecorder?.stop()
+        tts?.stop()
+        tts?.shutdown()
+        feedImageJob?.cancel()
         realtimeClient?.disconnect()
+        navigationBackendClient?.disconnect()
+    }
+
+    private fun speakTextLocally(text: String) {
+        if (text.isBlank()) return
+        isExternalSpeaking = true
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "guidance")
     }
 }

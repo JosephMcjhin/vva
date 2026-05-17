@@ -1,7 +1,6 @@
 package com.example.vva
 
 import android.content.Context
-import android.speech.tts.TextToSpeech
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -26,7 +25,6 @@ class VoiceViewModel : ViewModel() {
     private var microphoneRecorder: MicrophoneRecorder? = null
     private var realtimeClient: OmniRealtimeClient? = null
     private var navigationBackendClient: NavigationBackendClient? = null
-    private var tts: TextToSpeech? = null
 
     @Volatile
     private var isInitializer = false
@@ -34,6 +32,7 @@ class VoiceViewModel : ViewModel() {
     @Volatile
     private var isUserSpeaking = false
     private var isExternalSpeaking = false
+    private var lastNavAudioTimestamp = 0L
 
     private var feedImageJob: Job? = null
 
@@ -48,12 +47,7 @@ class VoiceViewModel : ViewModel() {
             return
         }
         isInitializer = true
-        // 初始化本地 TTS
-        tts = TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts?.language = java.util.Locale.CHINESE
-            }
-        }
+        
         viewModelScope.launch {
             try {
                 audioPlayer = AudioPlayer(context).apply { start() }
@@ -64,7 +58,16 @@ class VoiceViewModel : ViewModel() {
                     onStatusChanged = { status -> Timber.tag(TAG).i("Nav status: $status") },
                     onGuidanceText = { guidance ->
                         aiText.update { "[导航] $guidance" }
-                        speakTextLocally(guidance)
+                        // speakTextLocally(guidance) // 禁用本地 TTS，改用服务器下发的音频
+                    },
+                    onGuidanceAudio = { audioData, timestamp ->
+                        if (timestamp >= lastNavAudioTimestamp) {
+                            lastNavAudioTimestamp = timestamp
+                            // 收到更新的导航音频，强行插播（清空旧缓冲区）
+                            audioPlayer?.interruptAndPlay(audioData)
+                        } else {
+                            Timber.tag(TAG).w("Discarding outdated nav audio (ts: $timestamp, last: $lastNavAudioTimestamp)")
+                        }
                     }
                 )
                 realtimeClient = OmniRealtimeClient(
@@ -183,16 +186,13 @@ class VoiceViewModel : ViewModel() {
         super.onCleared()
         audioPlayer?.stop()
         microphoneRecorder?.stop()
-        tts?.stop()
-        tts?.shutdown()
         feedImageJob?.cancel()
         realtimeClient?.disconnect()
         navigationBackendClient?.disconnect()
     }
 
     private fun speakTextLocally(text: String) {
-        if (text.isBlank()) return
-        isExternalSpeaking = true
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "guidance")
+        // 废弃本地 TTS，仅保留日志用于调试流程
+        Timber.tag(TAG).d("Local TTS (Disabled): $text")
     }
 }

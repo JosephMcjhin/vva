@@ -124,6 +124,29 @@ class AudioPlayer(private val context: Context) {
     }
 
     /**
+     * 强行插播：清空队列和 AudioTrack 缓冲区，立即播放新数据。
+     */
+    fun interruptAndPlay(audioData: ByteArray) {
+        if (!isPlaying) return
+        
+        audioQueue.clear()
+        try {
+            audioTrack?.apply {
+                pause()
+                flush()
+                play()
+            }
+            Timber.tag(TAG).d("执行强行插播，已重置缓冲区")
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "重置 AudioTrack 缓冲区失败")
+        }
+        
+        if (audioData.isNotEmpty()) {
+            audioQueue.offer(audioData)
+        }
+    }
+
+    /**
      * 协程中的音频写入循环。
      */
     private suspend fun playAudio() {

@@ -7,6 +7,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
 import timber.log.Timber
+import android.util.Base64
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -17,7 +18,8 @@ import java.util.concurrent.TimeUnit
 class NavigationBackendClient(
     private val backendWsUrl: String,
     private val onStatusChanged: (String) -> Unit,
-    private val onGuidanceText: (String) -> Unit
+    private val onGuidanceText: (String) -> Unit,
+    private val onGuidanceAudio: (ByteArray, Long) -> Unit
 ) {
 
     private companion object {
@@ -46,6 +48,10 @@ class NavigationBackendClient(
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 isConnected = true
+                webSocket.send(JSONObject().apply {
+                    put("type", "register")
+                    put("role", "glasses")
+                }.toString())
                 onStatusChanged("Connected")
                 Timber.tag(TAG).i("Connected to Indoor Navigation Backend")
             }
@@ -125,6 +131,21 @@ class NavigationBackendClient(
                 val prompt = json.optString("text")
                 if (prompt.isNotEmpty()) {
                     onGuidanceText(prompt)
+                }
+            } else if (type == "nav_audio") {
+                val prompt = json.optString("text")
+                val audioB64 = json.optString("audio")
+                if (prompt.isNotEmpty()) {
+                    onGuidanceText(prompt)
+                }
+                if (audioB64.isNotEmpty()) {
+                    val timestamp = json.optLong("timestamp", System.currentTimeMillis())
+                    try {
+                        val audioData = Base64.decode(audioB64, Base64.DEFAULT)
+                        onGuidanceAudio(audioData, timestamp)
+                    } catch (e: Exception) {
+                        Timber.tag(TAG).e(e, "Error decoding TTS audio")
+                    }
                 }
             }
         } catch (e: Exception) {

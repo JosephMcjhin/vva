@@ -32,6 +32,62 @@ class AudioPlayer(private val context: Context) {
     private var playbackJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
 
+    // ── 音量 / ducking（被其它播放器压低） ──────────────────────────────────
+    // 当前生效音量 = normalVolume * duckFactor。duckFactor 在 duck() 时变小、
+    // unduck() 时回到 1.0，用于「导航说话时把 LLM 压低」的效果。
+    @Volatile private var normalVolume = 1.0f
+    @Volatile private var duckFactor = 1.0f
+    private val duckLock = Any()
+
+    /**
+     * 队列从「有数据」变为「空」时回调一次（在播放协程里触发）。
+     * 用于通知上层「本播放器的音频已全部播完」，可据此恢复被 duck 的其它播放器。
+     * 注意：仅在真正写出过数据后才会触发，避免刚 start 就误触发。
+     */
+    var onQueueDrained: (() -> Unit)? = null
+    @Volatile private var hasEverPlayedData = false
+
+    private fun applyVolume() {
+        val v = (normalVolume * duckFactor).coerceIn(0.0f, 1.0f)
+        try {
+            audioTrack?.setVolume(v)
+        } catch (e: Exception) {
+            // 部分 ROM 对 setVolume 支持不全，忽略
+        }
+    }
+
+    /**
+     * 设置正常音量（0.0 ~ 1.0）。不会被 duck 影响。
+     */
+    fun setNormalVolume(v: Float) {
+        synchronized(duckLock) {
+            normalVolume = v.coerceIn(0.0f, 1.0f)
+            applyVolume()
+        }
+    }
+
+    /**
+     * 闪避：把当前播放音量压低到 [factor]（0.0 ~ 1.0，通常 0.3）。
+     * 用于「导航 TTS 开始播放时，把 LLM 对话音频压低」。
+     */
+    fun duck(factor: Float = 0.3f) {
+        synchronized(duckLock) {
+            duckFactor = factor.coerceIn(0.0f, 1.0f)
+            applyVolume()
+        }
+    }
+
+    /**
+     * 恢复：撤销 duck()，音量回到正常水平。
+     * 用于「导航 TTS 播放结束后，把 LLM 对话音频音量还原」。
+     */
+    fun unduck() {
+        synchronized(duckLock) {
+            duckFactor = 1.0f
+            applyVolume()
+        }
+    }
+
     /**
      * 初始化并开始 AudioTrack 播放。
      */
@@ -76,6 +132,7 @@ class AudioPlayer(private val context: Context) {
 
             audioTrack?.play()
             isPlaying = true
+            applyVolume()  // 应用初始音量（含可能的 duck 状态）
 
             playbackJob = scope.launch {
                 playAudio()
@@ -163,6 +220,14 @@ class AudioPlayer(private val context: Context) {
                 audioData?.let { data ->
                     // 写入数据到 AudioTrack
                     val written = audioTrack?.write(data, 0, data.size) ?: 0
+                    hasEverPlayedData = true
+                }
+
+                // 队列已空 + 之前播放过数据 → 通知上层「播完了」
+                // （用于让 LLM 在导航 TTS 真正播完后才恢复音量）
+                if (hasEverPlayedData && audioQueue.isEmpty()) {
+                    hasEverPlayedData = false
+                    onQueueDrained?.invoke()
                 }
 
                 // 避免 CPU 过度消耗

@@ -21,7 +21,8 @@ class VoiceViewModel : ViewModel() {
         private const val IMAGE_POLLING_INTERVAL = 500L // 轮询间隔
     }
 
-    private var audioPlayer: AudioPlayer? = null
+    private var audioPlayer: AudioPlayer? = null       // LLM 对话音频（OmniRealtime）
+    private var navAudioPlayer: AudioPlayer? = null    // 导航 TTS 音频，独立播放，可与 LLM 同时出声
     private var microphoneRecorder: MicrophoneRecorder? = null
     private var realtimeClient: OmniRealtimeClient? = null
     private var navigationBackendClient: NavigationBackendClient? = null
@@ -43,6 +44,7 @@ class VoiceViewModel : ViewModel() {
 
     fun initialize(context: Context, imageManager: ImageManager) {
         if (isInitializer) {
+            navigationBackendClient?.connectIfNeeded()
             realtimeClient?.connect()
             return
         }
@@ -51,25 +53,49 @@ class VoiceViewModel : ViewModel() {
         viewModelScope.launch {
             try {
                 audioPlayer = AudioPlayer(context).apply { start() }
+                navAudioPlayer = AudioPlayer(context).apply {
+                    start()
+                    // 导航 TTS 真正播完后（队列耗尽），恢复 LLM 对话音量
+                    onQueueDrained = {
+                        audioPlayer?.unduck()
+                    }
+                }
                 microphoneRecorder = MicrophoneRecorder(context)
                 // Initialize Navigation Backend Client
                 navigationBackendClient = NavigationBackendClient(
-                    backendWsUrl = context.getString(R.string.nav_backend_url),
+                    backendWsUrls = listOf(
+                        context.getString(R.string.nav_backend_url_1),
+                        context.getString(R.string.nav_backend_url_2),
+                        context.getString(R.string.nav_backend_url_3),
+                    ),
                     onStatusChanged = { status -> Timber.tag(TAG).i("Nav status: $status") },
                     onGuidanceText = { guidance ->
                         aiText.update { "[导航] $guidance" }
                         // speakTextLocally(guidance) // 禁用本地 TTS，改用服务器下发的音频
                     },
-                    onGuidanceAudio = { audioData, timestamp ->
+                    onGuidanceAudioStart = { timestamp ->
                         if (timestamp >= lastNavAudioTimestamp) {
                             lastNavAudioTimestamp = timestamp
-                            // 收到更新的导航音频，强行插播（清空旧缓冲区）
-                            audioPlayer?.interruptAndPlay(audioData)
-                        } else {
-                            Timber.tag(TAG).w("Discarding outdated nav audio (ts: $timestamp, last: $lastNavAudioTimestamp)")
+                            // 新句开始：只清导航自身的队列，不影响 LLM 对话音频
+                            navAudioPlayer?.prepareForNextTurn()
+                            // ducking：导航要说话了，把 LLM 对话音量压低，避免互相盖住
+                            audioPlayer?.duck(0.6f)
                         }
+                    },
+                    onGuidanceAudio = { audioData, timestamp ->
+                        if (timestamp >= lastNavAudioTimestamp) {
+                            // 流式 chunk：顺序入队，AudioTrack 边收边播（首字延迟低）
+                            navAudioPlayer?.addAudioData(audioData)
+                        } else {
+                            Timber.tag(TAG).w("Discarding outdated nav audio chunk (ts: $timestamp, last: $lastNavAudioTimestamp)")
+                        }
+                    },
+                    onGuidanceAudioEnd = { timestamp ->
+                        // 无需在此 unduck；navAudioPlayer 的 onQueueDrained 会在
+                        // 导航音频真正播完后自动恢复 LLM 音量（更准确）。
                     }
                 )
+                navigationBackendClient?.connectIfNeeded()
                 realtimeClient = OmniRealtimeClient(
                     apiKey = context.getString(R.string.api_key),
                     onConnected = {
@@ -104,10 +130,21 @@ class VoiceViewModel : ViewModel() {
                         userText.update { text }
                         Timber.tag(TAG).i("onAsrResult: $text")
                         val intent = NavigationKeywordMatcher.match(text)
-                        if (intent.isStop) {
-                            navigationBackendClient?.sendStopNavigationRequest()
-                        } else if (intent.isNavigation) {
-                            navigationBackendClient?.sendNavigationRequest(text, intent.target)
+                        when {
+                            intent.isStopSpeaking -> {
+                                // 立即静音所有播放（LLM 对话 + 导航 TTS），恢复音量
+                                Timber.tag(TAG).i("Stop-speaking command: silencing all playback")
+                                realtimeClient?.clearAudioBuffer()
+                                audioPlayer?.prepareForNextTurn()
+                                audioPlayer?.unduck()
+                                navAudioPlayer?.prepareForNextTurn()
+                            }
+                            intent.isStop -> {
+                                navigationBackendClient?.sendStopNavigationRequest()
+                            }
+                            intent.isNavigation -> {
+                                navigationBackendClient?.sendNavigationRequest(text, intent.target)
+                            }
                         }
                     },
                     onVadBegin = {
@@ -185,6 +222,7 @@ class VoiceViewModel : ViewModel() {
     override fun onCleared() {
         super.onCleared()
         audioPlayer?.stop()
+        navAudioPlayer?.stop()
         microphoneRecorder?.stop()
         feedImageJob?.cancel()
         realtimeClient?.disconnect()

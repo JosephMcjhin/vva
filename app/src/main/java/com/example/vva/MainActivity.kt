@@ -100,5 +100,6 @@ class MainActivity : AppCompatActivity() {
             imageManager = ImageManager(this, bind.previewView)
         }
         imageManager?.startCamera()
+        imageManager?.let { viewModel.initialize(this, it) }
     }
 }

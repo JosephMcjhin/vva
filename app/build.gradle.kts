@@ -7,7 +7,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.vva"
+        applicationId = "com.example.vva.v2"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

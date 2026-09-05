@@ -84,13 +84,6 @@
                 android:text="小维" />
 
             <Button
-                android:id="@+id/btnCamera"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:textColor="#FF2196F3"
-                android:text="相机关" />
-            <Button
                 android:id="@+id/btnChannelSwap"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"

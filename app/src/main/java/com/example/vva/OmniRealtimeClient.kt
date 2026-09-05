@@ -310,14 +310,6 @@ class OmniRealtimeClient(
         conversation?.appendVideo(b64)
     }
 
-    fun clearAudioBuffer() {
-        if (!isConnected) {
-            return
-        }
-        // Timber.i("clearAudioBuffer")
-        // conversation?.clearAppendedAudio()
-    }
-
     private fun handleEvent(event: JsonObject) {
         val type = event.get("type").asString
         when (type) {

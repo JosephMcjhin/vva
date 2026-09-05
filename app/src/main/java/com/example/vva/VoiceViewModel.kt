@@ -173,7 +173,7 @@ class VoiceViewModel : ViewModel() {
                         dashscopeState.update { "connected" }
                         dashscopeError.update { "" }
                         startRecording()
-                        //startCamera(imageManager)
+                        activeImageManager?.let { startCamera(it) }
                     },
                     onDisconnected = { reason ->
                         Timber.tag(TAG).i("onDisconnected: $reason")
@@ -197,7 +197,6 @@ class VoiceViewModel : ViewModel() {
                         if (!hasPendingDecision) {
                             suppressCurrentLlmResponse()
                         }
-                        realtimeClient?.clearAudioBuffer()
                     },
                     onAsrResult = { text ->
                         userText.update { text }
@@ -210,7 +209,6 @@ class VoiceViewModel : ViewModel() {
                                 isExternalSpeaking = false
                                 // 立即静音所有播放（LLM 对话 + 导航 TTS），恢复音量
                                 Timber.tag(TAG).i("Stop-speaking command: silencing all playback")
-                                realtimeClient?.clearAudioBuffer()
                                 audioPlayer?.prepareForNextTurn()
                                 audioPlayer?.unduck()
                                 navAudioPlayer?.prepareForNextTurn()
@@ -280,6 +278,9 @@ class VoiceViewModel : ViewModel() {
 
     fun setImageManager(imageManager: ImageManager?) {
         activeImageManager = imageManager
+        if (imageManager != null && realtimeClient?.isConnected() == true) {
+            startCamera(imageManager)
+        }
     }
 
     fun setBeepChannelSwap(swapped: Boolean) {

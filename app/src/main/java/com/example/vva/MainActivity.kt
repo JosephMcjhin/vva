@@ -42,7 +42,6 @@ class MainActivity : AppCompatActivity() {
     private var currentBeepInfo = ""
     private var currentPerfInfo = "CPU -- | MEM --"
     private var imageManager: ImageManager? = null
-    private var isCameraOn = false
     private var areChannelsSwapped = false
 
     private val requestPermissions = registerForActivityResult(
@@ -50,20 +49,11 @@ class MainActivity : AppCompatActivity() {
     ) { result ->
         val allGranted = result.values.all { it }
         if (!allGranted) {
-            toast("需要麦克风权限")
+            toast("需要麦克风和相机权限")
         } else {
+            startCameraPreview()
             bind.btnConnect.isEnabled = true
             viewModel.initialize(this, imageManager)
-        }
-    }
-
-    private val requestCameraPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            startCameraPreview()
-        } else {
-            toast("需要相机权限")
         }
     }
 
@@ -75,13 +65,10 @@ class MainActivity : AppCompatActivity() {
         // 保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        bind.previewView.visibility = View.GONE
+        bind.previewView.visibility = View.VISIBLE
         bind.btnConnect.isEnabled = false
         bind.btnConnect.setOnClickListener {
             viewModel.initialize(this, imageManager)
-        }
-        bind.btnCamera.setOnClickListener {
-            toggleCamera()
         }
         bind.btnChannelSwap.setOnClickListener {
             areChannelsSwapped = !areChannelsSwapped
@@ -160,30 +147,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkAndRequestPermissions() {
-        val needs = arrayOf(Manifest.permission.RECORD_AUDIO)
+        val needs = arrayOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CAMERA
+        )
         val notGranted = needs.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
         if (notGranted.isNotEmpty()) {
             requestPermissions.launch(notGranted.toTypedArray())
         } else {
+            startCameraPreview()
             bind.btnConnect.isEnabled = true
             viewModel.initialize(this, imageManager)
-        }
-    }
-
-    private fun toggleCamera() {
-        if (isCameraOn) {
-            stopCameraPreview()
-            return
-        }
-
-        val permissionState =
-            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-        if (permissionState == PackageManager.PERMISSION_GRANTED) {
-            startCameraPreview()
-        } else {
-            requestCameraPermission.launch(Manifest.permission.CAMERA)
         }
     }
 
@@ -194,13 +170,9 @@ class MainActivity : AppCompatActivity() {
                     .also { imageManager = it }
                 bind.previewView.visibility = View.VISIBLE
                 manager.startCamera()
-                isCameraOn = true
-                bind.btnCamera.text = "相机开"
                 viewModel.setImageManager(manager)
             } catch (_: Exception) {
                 bind.previewView.visibility = View.GONE
-                isCameraOn = false
-                bind.btnCamera.text = "相机关"
                 viewModel.setImageManager(null)
                 toast("相机启动失败")
             }
@@ -210,10 +182,8 @@ class MainActivity : AppCompatActivity() {
     private fun stopCameraPreview() {
         imageManager?.stopCamera()
         imageManager = null
-        isCameraOn = false
         if (::bind.isInitialized) {
             bind.previewView.visibility = View.GONE
-            bind.btnCamera.text = "相机关"
         }
         viewModel.setImageManager(null)
     }

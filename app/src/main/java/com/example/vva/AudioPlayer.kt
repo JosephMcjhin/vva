@@ -3,10 +3,10 @@ package com.example.vva
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioTrack
 import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 import timber.log.Timber
 
 /**
@@ -22,10 +22,12 @@ class AudioPlayer(private val context: Context) {
         private const val CHANNELS = 1 // 单声道
         private const val SAMPLE_WIDTH = 2 // 16-bit PCM (2 bytes per sample)
         private const val BYTES_PER_FRAME = CHANNELS * SAMPLE_WIDTH // 每帧 2 字节
+        private const val MAX_QUEUE_CHUNKS = 60
     }
 
     private var audioTrack: AudioTrack? = null
     private val audioQueue = ConcurrentLinkedQueue<ByteArray>()
+    private val queuedChunks = AtomicInteger(0)
 
     @Volatile
     private var isPlaying = false
@@ -120,7 +122,6 @@ class AudioPlayer(private val context: Context) {
                         .build()
                 )
                 .setBufferSizeInBytes(bufferSizeInBytes)
-                .setSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE)
                 .build()
 
             if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
@@ -150,7 +151,7 @@ class AudioPlayer(private val context: Context) {
     fun stop() {
         isPlaying = false
         playbackJob?.cancel()
-        audioQueue.clear()
+        clearQueue()
 
         try {
             audioTrack?.stop()
@@ -168,16 +169,31 @@ class AudioPlayer(private val context: Context) {
      */
     fun addAudioData(audioData: ByteArray) {
         if (isPlaying && audioData.isNotEmpty()) {
+            while (queuedChunks.get() >= MAX_QUEUE_CHUNKS) {
+                if (pollAudioData() == null) break
+            }
             audioQueue.offer(audioData)
+            queuedChunks.incrementAndGet()
         }
     }
 
     /**
-     * 清空待播放队列。
+     * 清空待播放队列，并刷新 AudioTrack 中已经写入但尚未播放的旧数据。
+     * 导航 TTS 的新句子到达时调用，保证旧句不会继续从硬件缓冲区播出。
      */
     fun prepareForNextTurn() {
-        audioQueue.clear()
-        Timber.tag(TAG).d("清除音频队列")
+        clearQueue()
+        hasEverPlayedData = false
+        try {
+            audioTrack?.apply {
+                pause()
+                flush()
+                play()
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "刷新 AudioTrack 缓冲区失败")
+        }
+        Timber.tag(TAG).d("清除音频队列并刷新播放缓冲区")
     }
 
     /**
@@ -186,7 +202,7 @@ class AudioPlayer(private val context: Context) {
     fun interruptAndPlay(audioData: ByteArray) {
         if (!isPlaying) return
         
-        audioQueue.clear()
+        clearQueue()
         try {
             audioTrack?.apply {
                 pause()
@@ -200,7 +216,21 @@ class AudioPlayer(private val context: Context) {
         
         if (audioData.isNotEmpty()) {
             audioQueue.offer(audioData)
+            queuedChunks.incrementAndGet()
         }
+    }
+
+    private fun clearQueue() {
+        audioQueue.clear()
+        queuedChunks.set(0)
+    }
+
+    private fun pollAudioData(): ByteArray? {
+        val data = audioQueue.poll()
+        if (data != null) {
+            queuedChunks.updateAndGet { (it - 1).coerceAtLeast(0) }
+        }
+        return data
     }
 
     /**
@@ -214,7 +244,7 @@ class AudioPlayer(private val context: Context) {
                     while (audioQueue.isEmpty() && isPlaying) {
                         delay(10)
                     }
-                    audioQueue.poll()
+                    pollAudioData()
                 }
 
                 audioData?.let { data ->

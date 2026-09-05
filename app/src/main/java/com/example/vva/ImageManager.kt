@@ -15,6 +15,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class ImageManager(private val context: Context, private val previewView: PreviewView) {
 
@@ -30,8 +31,24 @@ class ImageManager(private val context: Context, private val previewView: Previe
      * 启动相机预览并绑定 ImageCapture 用例。
      */
     suspend fun startCamera() {
-        // 使用 Coroutine 暂停等待 CameraProvider 初始化
-        val cameraProvider = ProcessCameraProvider.getInstance(context).get()
+        // CameraProvider 初始化可能比较慢，不能在主线程直接 future.get()。
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+        val cameraProvider = suspendCancellableCoroutine<ProcessCameraProvider> { cont ->
+            cameraProviderFuture.addListener({
+                try {
+                    if (cont.isActive) {
+                        cont.resume(cameraProviderFuture.get())
+                    }
+                } catch (e: Exception) {
+                    if (cont.isActive) {
+                        cont.resumeWithException(e)
+                    }
+                }
+            }, ContextCompat.getMainExecutor(context))
+            cont.invokeOnCancellation {
+                cameraProviderFuture.cancel(true)
+            }
+        }
 
         // 1. 预览配置
         val preview = Preview.Builder().build().also {

@@ -8,6 +8,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 import timber.log.Timber
 import android.util.Base64
+import java.net.URI
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -25,7 +26,19 @@ class NavigationBackendClient(
     private val onGuidanceText: (String) -> Unit,
     private val onGuidanceAudioStart: (Long) -> Unit,
     private val onGuidanceAudio: (ByteArray, Long) -> Unit,
-    private val onGuidanceAudioEnd: (Long) -> Unit
+    private val onGuidanceAudioEnd: (Long) -> Unit,
+    // 蜂鸣引导：active=false 表示停止；active=true 时
+    //   - freqHz 为目标频率（Hz），越接近目标频率越高（由 UE 端计算后下发）
+    //   - pan 为左右平衡（-1=全左, 0=居中, +1=全右），由 UE 根据 AngleError 符号决定
+    //   - volume 为总音量缩放（0..1），UE 可在接近目标时降低音量避免刺耳
+    //   - intervalMs 为蜂鸣间隔（毫秒），由 UE 根据 Progress 动态下发
+    //   - beepType 为蜂鸣模式："turn_calibrate"=高频警报
+    private val onBeep: (active: Boolean, freqHz: Int, pan: Float, volume: Float,
+                         intervalMs: Float, beepType: String) -> Unit = { _, _, _, _, _, _ -> },
+    private val onDrip: (active: Boolean, intervalMs: Float) -> Unit = { _, _ -> },
+    // 离散音效事件回调：soundId = "waypoint" | "deviation" | "arrival"
+    private val onSound: (soundId: String) -> Unit = {},
+    private val onWarning: (message: String) -> Unit = {}
 ) {
 
     private companion object {
@@ -47,23 +60,87 @@ class NavigationBackendClient(
     /** 当前实际连上的服务器地址，便于日志/UI 展示。 */
     @Volatile
     private var connectedUrl: String? = null
+    private val connectLock = Any()
 
-    fun connectIfNeeded() {
-        if (isConnected || webSocket != null) return
+    fun connectIfNeeded(): Boolean = synchronized(connectLock) {
+        if (isConnected && webSocket != null) return@synchronized true
+        if (!isConnected && webSocket != null) {
+            try {
+                webSocket?.cancel()
+            } catch (_: Exception) {
+            }
+            webSocket = null
+            connectedUrl = null
+        }
         val urls = backendWsUrls.filter { it.isNotBlank() }
         if (urls.isEmpty()) {
             Timber.tag(TAG).w("Navigation backend URL list is empty")
-            return
+            return@synchronized false
         }
 
         // 依次尝试每个候选地址；连上一个就停。
         for (url in urls) {
             if (tryConnect(url)) {
-                return
+                return@synchronized true
             }
         }
         onStatusChanged("All backends unreachable")
-        Timber.tag(TAG).w("All %d candidate backends failed", urls.size)
+        Timber.tag(TAG).w("All ${urls.size} candidate backends failed")
+        false
+    }
+
+    /**
+     * 检查当前导航后端是否真的可达。
+     * WebSocket 保持连接不代表 Flask/HTTP 服务仍能正常响应，因此 UI 状态使用这个结果。
+     * 未建立 WebSocket 时按候选地址顺序探测，便于连接循环继续发现后端。
+     */
+    fun pingCurrentBackend(): Boolean {
+        val urls = connectedUrl?.let { listOf(it) }
+            ?: backendWsUrls.filter { it.isNotBlank() }
+
+        for (wsUrl in urls) {
+            val healthUrl = toHealthUrl(wsUrl) ?: continue
+            try {
+                val request = Request.Builder().url(healthUrl).get().build()
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        Timber.tag(TAG).d("Backend ping OK: %s", healthUrl)
+                        return true
+                    }
+                    Timber.tag(TAG).w(
+                        "Backend ping failed: %s (HTTP %d)",
+                        healthUrl,
+                        response.code
+                    )
+                }
+            } catch (e: Exception) {
+                Timber.tag(TAG).w("Backend ping failed for %s: %s", healthUrl, e.message)
+            }
+        }
+        return false
+    }
+
+    private fun toHealthUrl(wsUrl: String): String? {
+        return try {
+            val parsed = URI(wsUrl)
+            val httpScheme = when (parsed.scheme?.lowercase()) {
+                "wss" -> "https"
+                "ws" -> "http"
+                else -> return null
+            }
+            URI(
+                httpScheme,
+                parsed.userInfo,
+                parsed.host,
+                parsed.port,
+                "/",
+                null,
+                null
+            ).toString()
+        } catch (e: Exception) {
+            Timber.tag(TAG).w("Invalid backend URL for ping: %s", wsUrl)
+            null
+        }
     }
 
     /**
@@ -147,11 +224,17 @@ class NavigationBackendClient(
     }
 
     fun sendNavigationRequest(query: String, target: String?) {
-        val socket = webSocket
+        var socket = webSocket
         if (socket == null || !isConnected) {
             Timber.tag(TAG).w("Cannot send request: Not connected")
-            connectIfNeeded()
-            return
+            if (!connectIfNeeded()) {
+                return
+            }
+            socket = webSocket
+            if (socket == null || !isConnected) {
+                Timber.tag(TAG).w("Cannot send request after reconnect: Not connected")
+                return
+            }
         }
 
         val payload = JSONObject().apply {
@@ -161,7 +244,7 @@ class NavigationBackendClient(
             put("target", target ?: JSONObject.NULL)
         }
 
-        socket.send(payload.toString())
+        socket?.send(payload.toString())
         Timber.tag(TAG).i("Sent navigation request for target: $target")
     }
 
@@ -190,6 +273,14 @@ class NavigationBackendClient(
         try {
             val json = JSONObject(text)
             val type = json.optString("type")
+
+            if (type == "warning" || type == "backend_warning") {
+                val message = json.optString("text")
+                if (message.isNotEmpty()) {
+                    onWarning(message)
+                }
+                return
+            }
             
             // "nav_prompt" / "status" : 纯文本提示
             if (type == "nav_prompt" || type == "navigation_prompt" || type == "status") {
@@ -230,6 +321,32 @@ class NavigationBackendClient(
                     // 通知上层：本轮 TTS 已下发完毕（可恢复被压低的其它音频）
                     val ts = json.optLong("timestamp", System.currentTimeMillis())
                     onGuidanceAudioEnd(ts)
+                }
+                "nav_beep" -> {
+                    // 蜂鸣引导：UE 端根据剩余角度/距离计算频率后下发。
+                    // pan（左右平衡，-1..1）和 volume（0..1）为可选字段，缺省时居中/满音量。
+                    // beep_type: "turn_calibrate"=转向高频警报
+                    val active = json.optBoolean("active", false)
+                    val freqHz = json.optInt("freq_hz", 0)
+                    val pan = json.optDouble("pan", 0.0).toFloat()
+                    val volume = json.optDouble("volume", 1.0).toFloat()
+                    val intervalMs = json.optDouble("interval_ms", 0.0).toFloat()
+                    val beepType = json.optString("beep_type", "")
+                    onBeep(active, freqHz, pan, volume, intervalMs, beepType)
+                }
+                "nav_drip" -> {
+                    val active = json.optBoolean("active", false)
+                    val intervalMs = json.optDouble("interval_ms", 0.0).toFloat()
+                    onDrip(active, intervalMs)
+                }
+                "nav_sound" -> {
+                    // 离散音效事件：UE 端在到达路点/偏离/到达终点时发送。
+                    // sound: "waypoint" | "deviation" | "arrival"
+                    val soundId = json.optString("sound", "")
+                    if (soundId.isNotEmpty()) {
+                        Timber.tag(TAG).i("nav_sound: %s", soundId)
+                        onSound(soundId)
+                    }
                 }
             }
         } catch (e: Exception) {

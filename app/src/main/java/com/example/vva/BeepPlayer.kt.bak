@@ -1,0 +1,180 @@
+package com.example.vva
+
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import kotlin.math.PI
+import kotlin.math.sin
+
+/**
+ * 蜂鸣引导音播放器。
+ *
+ * 由 UE 端的 `nav_beep` 消息驱动：
+ *  - active=true, freqHz=N  → 持续播放频率为 N Hz 的正弦蜂鸣
+ *  - active=false           → 停止
+ *
+ * 实现方式：用 AudioTrack 流式播放一个固定长度、循环刷新的正弦缓冲区，
+ * 频率变化时重建缓冲区并写入（避免 ToneGenerator 频率档位有限的问题）。
+ *
+ * 越接近目标，UE 端下发的 freqHz 越高，App 端无须自己计算。
+ */
+class BeepPlayer(
+    private val sampleRate: Int = 44100,
+    private val amplitude: Float = 0.5f
+) {
+
+    private companion object {
+        private const val TAG = "BeepPlayer"
+        // 一段蜂鸣缓冲区对应的毫秒数（用于循环写入与频率更新节流）。
+        private const val CHUNK_MS = 60
+    }
+
+    private val scope = CoroutineScope(Dispatchers.IO)
+
+    @Volatile private var currentFreqHz: Int = 0
+    @Volatile private var shouldPlay: Boolean = false
+    private var playJob: Job? = null
+
+    private var audioTrack: AudioTrack? = null
+
+    private fun ensureTrack(): AudioTrack? {
+        audioTrack?.let { if (it.playState == AudioTrack.PLAYSTATE_PLAYING) return it }
+        try {
+            val minBuf = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(sampleRate / 10)
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBuf)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            track.play()
+            audioTrack = track
+            return track
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Failed to create AudioTrack")
+            return null
+        }
+    }
+
+    /** 生成一段（chunkMs 毫秒）指定频率的正弦 PCM16 数据。 */
+    private fun synthChunk(freqHz: Int, chunkMs: Int): ShortArray {
+        val samples = sampleRate * chunkMs / 1000
+        val out = ShortArray(samples)
+        if (freqHz <= 0) return out
+        val phaseStep = 2.0 * PI * freqHz / sampleRate
+        var phase = 0.0
+        val amp = (Short.MAX_VALUE * amplitude).coerceIn(0f, Short.MAX_VALUE.toFloat()).toInt()
+        for (i in 0 until samples) {
+            out[i] = (sin(phase) * amp).toInt().toShort()
+            phase += phaseStep
+            if (phase > 2.0 * PI) phase -= 2.0 * PI
+        }
+        return out
+    }
+
+    private suspend fun loop() {
+        val track = ensureTrack() ?: return
+        val beepMs = 80  // 每声蜂鸣持续 80ms
+        var lastFreq = -1
+        var beepChunk: ShortArray = ShortArray(0)
+        var silenceChunk: ShortArray = ShortArray(0)
+
+        try {
+            while (scope.isActive && shouldPlay) {
+                val f = currentFreqHz
+                if (f <= 0) {
+                    if (lastFreq != 0) {
+                        silenceChunk = ShortArray(sampleRate * beepMs / 1000)
+                        lastFreq = 0
+                    }
+                    track.write(silenceChunk, 0, silenceChunk.size)
+                    delay(beepMs.toLong())
+                    continue
+                }
+
+                // 频率越高，间隔越短：400Hz→300ms, 1200Hz→50ms
+                val gapMs = ((1200 - f) / 4 + 50).coerceIn(30, 300)
+                if (f != lastFreq) {
+                    beepChunk = synthChunk(f, beepMs)
+                    silenceChunk = ShortArray(sampleRate * gapMs / 1000)
+                    lastFreq = f
+                }
+
+                // 蜂鸣
+                track.write(beepChunk, 0, beepChunk.size)
+                delay(beepMs.toLong())
+
+                // 静音间隔（如果频率没变且仍应播放）
+                if (shouldPlay && currentFreqHz == f) {
+                    track.write(silenceChunk, 0, silenceChunk.size)
+                    delay(gapMs.toLong())
+                }
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Beep loop ended")
+        }
+    }
+
+    /**
+     * 由 nav_beep 消息驱动。
+     *  - active=false：停止蜂鸣。
+     *  - active=true, freqHz>0：开始/继续蜂鸣，使用给定频率。
+     */
+    fun setActive(active: Boolean, freqHz: Int) {
+        if (!active) {
+            stop()
+            return
+        }
+        currentFreqHz = freqHz.coerceAtLeast(0)
+        if (!shouldPlay) {
+            shouldPlay = true
+            playJob?.cancel()
+            playJob = scope.launch { loop() }
+        }
+    }
+
+    /** 停止蜂鸣并释放底层 AudioTrack。 */
+    fun stop() {
+        shouldPlay = false
+        playJob?.cancel()
+        playJob = null
+        try {
+            audioTrack?.apply {
+                if (playState != AudioTrack.PLAYSTATE_STOPPED) stop()
+                release()
+            }
+        } catch (_: Exception) {
+        }
+        audioTrack = null
+        currentFreqHz = 0
+    }
+
+    fun release() {
+        stop()
+        scope.cancel()
+    }
+}

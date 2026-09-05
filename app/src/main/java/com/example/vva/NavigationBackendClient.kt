@@ -38,7 +38,8 @@ class NavigationBackendClient(
     private val onDrip: (active: Boolean, intervalMs: Float) -> Unit = { _, _ -> },
     // 离散音效事件回调：soundId = "waypoint" | "deviation" | "arrival"
     private val onSound: (soundId: String) -> Unit = {},
-    private val onWarning: (message: String) -> Unit = {}
+    private val onWarning: (message: String) -> Unit = {},
+    private val onImuStatus: (status: String) -> Unit = {}
 ) {
 
     private companion object {
@@ -273,6 +274,11 @@ class NavigationBackendClient(
         try {
             val json = JSONObject(text)
             val type = json.optString("type")
+
+            if (type == "imu_status") {
+                onImuStatus(json.optString("status", "unknown"))
+                return
+            }
 
             if (type == "warning" || type == "backend_warning") {
                 val message = json.optString("text")

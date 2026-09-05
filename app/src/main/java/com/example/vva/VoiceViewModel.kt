@@ -159,6 +159,10 @@ class VoiceViewModel : ViewModel() {
                     onWarning = { warning ->
                         Timber.tag(TAG).w("Backend warning: $warning")
                         imuState.update { warning }
+                    },
+                    onImuStatus = { status ->
+                        Timber.tag(TAG).i("IMU status: $status")
+                        imuState.update { status }
                     }
                 )
                 connectNavigationBackendAsync()
